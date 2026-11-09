@@ -82,6 +82,30 @@ export interface ChargingStation {
   backupStationsNearby?: string[]; // IDs of backup stations
 }
 
+export interface StopCostBreakdown {
+  pricePerKwh: number;
+  energyKwh: number;
+  energyCost: number;
+  reservationFee: number;
+  gstTax: number;
+  totalStopCost: number;
+  effectiveCostPerKm: number;
+}
+
+export interface RouteCostAnalysis {
+  totalEnergyKwh: number;
+  weightedAvgPricePerKwh: number;
+  totalBaseEnergyCost: number;
+  totalReservationFees: number;
+  totalGstTax: number;
+  totalChargingCost: number;
+  costPerKm: number;
+  equivalentFuelCost: number;
+  fuelSavings: number;
+  savingsPercent: number;
+  homeChargingAlternativeCost: number;
+}
+
 export interface RouteStop {
   station: ChargingStation;
   selectedConnector: Connector;
@@ -91,6 +115,7 @@ export interface RouteStop {
   chargeTimeMinutes: number;
   energyNeededKwh: number;
   estimatedCost: number;
+  costBreakdown: StopCostBreakdown;
   detourMinutes: number;
   isRecommendedStop: boolean;
   reserveSafetyMarginPercent: number;
@@ -108,6 +133,7 @@ export interface RoutePlan {
     min: number;
     max: number;
   };
+  costAnalysis: RouteCostAnalysis;
   departureBatteryPercent: number;
   arrivalBatteryPercent: number;
   safetyReservePercent: number;

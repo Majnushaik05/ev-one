@@ -1,4 +1,4 @@
-import { Vehicle, ChargingStation, RoutePlan, RouteStop, Connector } from '../types/ev';
+import { Vehicle, ChargingStation, RoutePlan, RouteStop, Connector, RouteCostAnalysis, StopCostBreakdown } from '../types/ev';
 
 export interface PlanTripParams {
   origin: string;
@@ -9,6 +9,7 @@ export interface PlanTripParams {
   drivingStyle: 'eco' | 'normal' | 'spirited';
   acSetting: 'off' | 'normal' | 'max_cool';
   allStations: ChargingStation[];
+  routingPreference?: 'balanced' | 'fastest_charger' | 'lowest_cost';
 }
 
 export function calculateTripRoute(params: PlanTripParams): RoutePlan {
@@ -21,12 +22,12 @@ export function calculateTripRoute(params: PlanTripParams): RoutePlan {
     drivingStyle,
     acSetting,
     allStations,
+    routingPreference = 'balanced',
   } = params;
 
-  // Real highway corridor distances in India (with realistic coordinates and elevation profile)
+  // Real highway corridor distances in India
   let baseDistanceKm = 145; // Default Bengaluru to Mysuru
   const lowerDest = destination.toLowerCase();
-  const lowerOrig = origin.toLowerCase();
 
   if (lowerDest.includes('mysuru') || lowerDest.includes('mysore')) {
     baseDistanceKm = 148;
@@ -63,9 +64,7 @@ export function calculateTripRoute(params: PlanTripParams): RoutePlan {
   const needsCharging = baseDistanceKm > maxSafeDistanceKm;
 
   if (needsCharging) {
-    // Filter stations that are:
-    // 1. Compatible with vehicle connector
-    // 2. Not out of service
+    // Filter compatible stations
     const compatibleStations = allStations.filter((st) => {
       if (st.status === 'out_of_service') return false;
       return st.connectors.some((conn) => 
@@ -73,45 +72,89 @@ export function calculateTripRoute(params: PlanTripParams): RoutePlan {
       );
     });
 
-    // Select the best station along the route
-    const candidate = compatibleStations.find((s) => s.id === 'sta_zeon_maddur') ||
-      compatibleStations.find((s) => s.id === 'sta_jiobp_expressway') ||
-      compatibleStations[0];
+    // Check if route requires 1 or 2 stops
+    const numStopsNeeded = baseDistanceKm > (vehicle.realWorldRangeKm * 0.85) ? 2 : 1;
 
-    if (candidate) {
-      // Pick best matching connector (prefer fast DC matching vehicle capability)
-      const compatibleConnectors = candidate.connectors.filter((c) =>
-        vehicle.supportedConnectors.includes(c.type)
-      );
-      
-      compatibleConnectors.sort((a, b) => b.powerKw - a.powerKw);
-      const chosenConnector: Connector = compatibleConnectors[0];
+    // Sort stations based on preference:
+    // 'lowest_cost' sorts by min pricePerKwh
+    // 'fastest_charger' sorts by max powerKw
+    // 'balanced' prioritizes verified partners on the corridor
+    const rankedStations = [...compatibleStations].sort((a, b) => {
+      const aMinPrice = Math.min(...a.connectors.map((c) => c.pricePerKwh));
+      const bMinPrice = Math.min(...b.connectors.map((c) => c.pricePerKwh));
+      const aMaxKw = Math.max(...a.connectors.map((c) => c.powerKw));
+      const bMaxKw = Math.max(...b.connectors.map((c) => c.powerKw));
 
-      const stopDistanceKm = Math.min(Math.round(maxSafeDistanceKm * 0.85), Math.round(baseDistanceKm * 0.55));
-      const energyUsedBeforeStopKwh = (stopDistanceKm * adjustedWhPerKm) / 1000;
-      const energyAtArrivalKwh = Math.max(0, startUsableKwh - energyUsedBeforeStopKwh);
+      if (routingPreference === 'lowest_cost') {
+        return aMinPrice - bMinPrice;
+      }
+      if (routingPreference === 'fastest_charger') {
+        return bMaxKw - aMaxKw;
+      }
+      // Balanced: verified partners first, then price/power balance
+      if (a.integrationLevel === 'verified_partner' && b.integrationLevel !== 'verified_partner') return -1;
+      if (b.integrationLevel === 'verified_partner' && a.integrationLevel !== 'verified_partner') return 1;
+      return aMinPrice - bMinPrice;
+    });
+
+    const chosenStations = rankedStations.slice(0, numStopsNeeded);
+
+    let currentBatteryEnergy = startUsableKwh;
+    let accumulatedDistanceKm = 0;
+
+    chosenStations.forEach((candidate, idx) => {
+      const stopDistanceKm = numStopsNeeded === 1
+        ? Math.min(Math.round(maxSafeDistanceKm * 0.85), Math.round(baseDistanceKm * 0.55))
+        : Math.round((baseDistanceKm / (numStopsNeeded + 1)) * (idx + 1));
+
+      const legDistance = stopDistanceKm - accumulatedDistanceKm;
+      const energyUsedLeg = (legDistance * adjustedWhPerKm) / 1000;
+      const energyAtArrivalKwh = Math.max(0, currentBatteryEnergy - energyUsedLeg);
       const arrivalSoc = Math.max(
         reserveBufferPercent,
         Math.round((energyAtArrivalKwh / vehicle.usableCapacityKwh) * 100)
       );
 
-      const targetSoc = 85; // Recommend charging to 85% for battery health & fastest charging curve
+      // Connectors matching vehicle
+      const matchingConnectors = candidate.connectors.filter((c) =>
+        vehicle.supportedConnectors.includes(c.type)
+      );
+      matchingConnectors.sort((a, b) => {
+        if (routingPreference === 'lowest_cost') return a.pricePerKwh - b.pricePerKwh;
+        return b.powerKw - a.powerKw;
+      });
+      const chosenConnector: Connector = matchingConnectors[0];
+
+      const targetSoc = 85; // Optimal charging taper
       const targetKwh = (vehicle.usableCapacityKwh * targetSoc) / 100;
       const energyToChargeKwh = Math.max(5, targetKwh - energyAtArrivalKwh);
 
-      // Effective charging speed is limited by vehicle max DC charge rate and connector power
       const effectivePowerKw = Math.min(
         chosenConnector.powerKw,
         chosenConnector.type.includes('CCS') || chosenConnector.type.includes('DC')
           ? vehicle.maxDcChargeKw
           : vehicle.maxAcChargeKw
       );
-
-      // Average charging taper factor (0.85) to reflect the real-world battery curve above 60%
       const realisticAverageKw = effectivePowerKw * 0.82;
-      const chargeTimeMinutes = Math.round((energyToChargeKwh / realisticAverageKw) * 60) + 4; // +4 mins handshake
+      const chargeTimeMinutes = Math.round((energyToChargeKwh / realisticAverageKw) * 60) + 4;
 
-      const estimatedCost = Math.round(energyToChargeKwh * chosenConnector.pricePerKwh + candidate.reservationFee);
+      // Price per kWh and detailed tariff breakdown
+      const pricePerKwh = chosenConnector.pricePerKwh;
+      const baseEnergyCost = Math.round(energyToChargeKwh * pricePerKwh);
+      const reservationFee = candidate.reservationFee || 0;
+      const gstTax = Math.round((baseEnergyCost + reservationFee) * 0.18);
+      const totalStopCost = baseEnergyCost + reservationFee + gstTax;
+      const effectiveCostPerKm = legDistance > 0 ? Number((totalStopCost / legDistance).toFixed(2)) : 0;
+
+      const costBreakdown: StopCostBreakdown = {
+        pricePerKwh,
+        energyKwh: Number(energyToChargeKwh.toFixed(1)),
+        energyCost: baseEnergyCost,
+        reservationFee,
+        gstTax,
+        totalStopCost,
+        effectiveCostPerKm,
+      };
 
       stops.push({
         station: candidate,
@@ -121,12 +164,16 @@ export function calculateTripRoute(params: PlanTripParams): RoutePlan {
         targetBatteryPercent: targetSoc,
         chargeTimeMinutes,
         energyNeededKwh: Number(energyToChargeKwh.toFixed(1)),
-        estimatedCost,
+        estimatedCost: totalStopCost,
+        costBreakdown,
         detourMinutes: 2,
         isRecommendedStop: true,
         reserveSafetyMarginPercent: reserveBufferPercent,
       });
-    }
+
+      currentBatteryEnergy = targetKwh;
+      accumulatedDistanceKm = stopDistanceKm;
+    });
   }
 
   // Calculate final arrival SOC
@@ -147,10 +194,42 @@ export function calculateTripRoute(params: PlanTripParams): RoutePlan {
   const totalDriveTimeMinutes = Math.round((baseDistanceKm / avgSpeedKmh) * 60);
   const totalChargeTimeMinutes = stops.reduce((acc, s) => acc + s.chargeTimeMinutes, 0);
 
-  const baseCost = stops.reduce((acc, s) => acc + s.estimatedCost, 0);
+  // Aggregate Route Cost Analysis
+  const totalEnergyKwh = Number(stops.reduce((acc, s) => acc + s.costBreakdown.energyKwh, 0).toFixed(1));
+  const totalBaseEnergyCost = stops.reduce((acc, s) => acc + s.costBreakdown.energyCost, 0);
+  const totalReservationFees = stops.reduce((acc, s) => acc + s.costBreakdown.reservationFee, 0);
+  const totalGstTax = stops.reduce((acc, s) => acc + s.costBreakdown.gstTax, 0);
+  const totalChargingCost = totalBaseEnergyCost + totalReservationFees + totalGstTax;
+
+  const weightedAvgPricePerKwh = totalEnergyKwh > 0
+    ? Number((totalBaseEnergyCost / totalEnergyKwh).toFixed(2))
+    : (allStations[0]?.connectors[0]?.pricePerKwh || 20);
+
+  const costPerKm = Number((totalChargingCost / baseDistanceKm).toFixed(2));
+  
+  // Benchmark against equivalent petrol vehicle: 15 km/L @ ₹102/L (~₹6.80/km)
+  const equivalentFuelCost = Math.round(baseDistanceKm * 6.80);
+  const fuelSavings = Math.max(0, equivalentFuelCost - totalChargingCost);
+  const savingsPercent = equivalentFuelCost > 0 ? Math.round((fuelSavings / equivalentFuelCost) * 100) : 0;
+  const homeChargingAlternativeCost = Math.round(totalEnergyKwh * 7.50); // ₹7.50/kWh residential average
+
+  const costAnalysis: RouteCostAnalysis = {
+    totalEnergyKwh,
+    weightedAvgPricePerKwh,
+    totalBaseEnergyCost,
+    totalReservationFees,
+    totalGstTax,
+    totalChargingCost,
+    costPerKm,
+    equivalentFuelCost,
+    fuelSavings,
+    savingsPercent,
+    homeChargingAlternativeCost,
+  };
+
   const totalCostEstimate = {
-    min: Math.round(baseCost * 0.95),
-    max: Math.round(baseCost * 1.15),
+    min: Math.round(totalChargingCost * 0.95),
+    max: Math.round(totalChargingCost * 1.10),
   };
 
   return {
@@ -162,6 +241,7 @@ export function calculateTripRoute(params: PlanTripParams): RoutePlan {
     totalChargeTimeMinutes,
     stops,
     totalCostEstimate,
+    costAnalysis,
     departureBatteryPercent: departureSocPercent,
     arrivalBatteryPercent,
     safetyReservePercent: reserveBufferPercent,
